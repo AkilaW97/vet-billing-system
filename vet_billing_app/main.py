@@ -1,11 +1,11 @@
 
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox
 from datetime import datetime
 from pathlib import Path
 import os
 
-from db import init_db, save_invoice, list_invoices, get_invoice_by_receipt
+from db import init_db, save_invoice, list_invoices
 from invoice_pdf import create_invoice_pdf
 from printing import print_pdf
 
@@ -14,6 +14,114 @@ INVOICE_DIR = APP_DIR / "invoices"
 
 PAYMENT_METHODS = ["Cash", "Debit", "Credit", "Check"]
 MAX_ROWS = 12
+
+# ---- NEW: preset descriptions + Autocomplete widget ----
+PRESET_DESCRIPTIONS = [
+    "Consultation",
+    "Drug cost",
+    "Disposable",
+    "Transport",
+    "Surgery",
+    "Lab tests",
+    "Pet shop items",
+]
+
+class AutoCompleteEntry(ttk.Entry):
+    '''
+    A lightweight autocomplete Entry.
+    - Shows a Listbox of matches below the entry as you type.
+    - Press Enter to accept the highlighted suggestion (or your raw text).
+    - Arrow Up/Down to navigate suggestions; click to select.
+    '''
+    def __init__(self, master=None, suggestions=None, **kwargs):
+        super().__init__(master, **kwargs)
+        self.suggestions = suggestions or []
+        self.lb = None
+        self.bind("<KeyRelease>", self._on_keyrelease, add="+")
+        self.bind("<Return>", self._on_return, add="+")
+        self.bind("<Down>", self._on_down, add="+")
+        self.bind("<Up>", self._on_up, add="+")
+        self.bind("<FocusOut>", self._hide_listbox, add="+")
+
+    def _match_list(self, typed):
+        t = typed.strip().lower()
+        if not t:
+            return self.suggestions
+        return [s for s in self.suggestions if s.lower().startswith(t)] or [s for s in self.suggestions if t in s.lower()]
+
+    def _show_listbox(self, matches):
+        if self.lb is None:
+            self.lb = tk.Listbox(self.winfo_toplevel(), height=min(6, len(matches)))
+            self.lb.bind("<Button-1>", self._on_click)
+            self.lb.bind("<Return>", self._on_return)
+        else:
+            self.lb.delete(0, tk.END)
+            self.lb.configure(height=min(6, len(matches)))
+        for m in matches:
+            self.lb.insert(tk.END, m)
+
+        # position the listbox below the entry
+        x = self.winfo_rootx()
+        y = self.winfo_rooty() + self.winfo_height()
+        self.lb.place(x=x, y=y, width=self.winfo_width())
+        if matches:
+            self.lb.selection_clear(0, tk.END)
+            self.lb.selection_set(0)
+
+    def _hide_listbox(self, *_):
+        if self.lb is not None:
+            self.lb.place_forget()
+
+    def _on_keyrelease(self, event):
+        if event.keysym in ("Return","Up","Down","Escape"):
+            return
+        text = self.get()
+        matches = self._match_list(text)
+        if text and matches:
+            self._show_listbox(matches)
+        else:
+            self._hide_listbox()
+
+    def _accept_selection(self):
+        if self.lb and self.lb.size() > 0:
+            try:
+                idx = self.lb.curselection()[0]
+                value = self.lb.get(idx)
+                self.delete(0, tk.END)
+                self.insert(0, value)
+            except IndexError:
+                pass
+        self._hide_listbox()
+
+    def _on_return(self, event):
+        # If there is a suggested item, accept it; otherwise keep what user typed.
+        if self.lb and self.lb.size() > 0:
+            self._accept_selection()
+        # Allow the outer UI to move focus next if bound.
+        return "break"
+
+    def _on_click(self, event):
+        self._accept_selection()
+
+    def _on_down(self, event):
+        if self.lb and self.lb.size() > 0:
+            idxs = self.lb.curselection()
+            i = (idxs[0] + 1) if idxs else 0
+            if i >= self.lb.size(): i = 0
+            self.lb.selection_clear(0, tk.END)
+            self.lb.selection_set(i)
+        return "break"
+
+    def _on_up(self, event):
+        if self.lb and self.lb.size() > 0:
+            idxs = self.lb.curselection()
+            i = (idxs[0] - 1) if idxs else 0
+            if i < 0: i = self.lb.size() - 1
+            self.lb.selection_clear(0, tk.END)
+            self.lb.selection_set(i)
+        return "break"
+
+# -------------------------------------------------------
 
 def ensure_dirs():
     (APP_DIR / "data").mkdir(exist_ok=True)
@@ -72,14 +180,16 @@ class InvoiceApp(tk.Tk):
         cols = ["Item #", "Description", "Qty", "Unit Price", "Line Total"]
         self.entries = []
         for row in range(MAX_ROWS):
-            row_entries = {}
             for col, name in enumerate(cols):
                 ttk.Label(items_frame, text=name if row == 0 else "").grid(row=0, column=col, padx=6, sticky="w")
+
             e_item = ttk.Entry(items_frame, width=10)
-            e_desc = ttk.Entry(items_frame, width=60)
+            # NEW: AutoCompleteEntry for description
+            e_desc = AutoCompleteEntry(items_frame, suggestions=PRESET_DESCRIPTIONS, width=60)
             e_qty = ttk.Entry(items_frame, width=8)
             e_price = ttk.Entry(items_frame, width=12)
             e_total = ttk.Entry(items_frame, width=12, state="readonly")
+
             e_item.grid(row=row+1, column=0, padx=6, pady=2, sticky="w")
             e_desc.grid(row=row+1, column=1, padx=6, pady=2, sticky="we")
             e_qty.grid(row=row+1, column=2, padx=6, pady=2, sticky="w")
@@ -87,7 +197,7 @@ class InvoiceApp(tk.Tk):
             e_total.grid(row=row+1, column=4, padx=6, pady=2, sticky="w")
             items_frame.grid_columnconfigure(1, weight=1)
 
-            def on_change(event, erow=row, eq=e_qty, ep=e_price, et=e_total):
+            def recompute_from_row(event, eq=e_qty, ep=e_price, et=e_total):
                 try:
                     q = float(eq.get()) if eq.get() else 0.0
                     p = float(ep.get()) if ep.get() else 0.0
@@ -99,11 +209,17 @@ class InvoiceApp(tk.Tk):
                 except ValueError:
                     pass
 
-            e_qty.bind("<KeyRelease>", on_change)
-            e_price.bind("<KeyRelease>", on_change)
+            # Enter in Description accepts the suggestion and moves to Qty
+            def on_desc_enter(event, q_widget=e_qty):
+                # AutoCompleteEntry already accepts suggestion on <Return>
+                q_widget.focus_set()
+                return "break"
 
-            row_entries = dict(item=e_item, desc=e_desc, qty=e_qty, price=e_price, total=e_total)
-            self.entries.append(row_entries)
+            e_desc.bind("<Return>", on_desc_enter, add="+")
+            e_qty.bind("<KeyRelease>", recompute_from_row)
+            e_price.bind("<KeyRelease>", recompute_from_row)
+
+            self.entries.append(dict(item=e_item, desc=e_desc, qty=e_qty, price=e_price, total=e_total))
 
         # Totals + actions
         totals_frame = ttk.Frame(self)
